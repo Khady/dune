@@ -50,7 +50,8 @@
   dune_rpc_client
   spawn
   opam_format
-  xdg)
+  xdg
+  ninja_utils)
  (bootstrap_info bootstrap-info))
 
 ; Installing the dune binary depends on the kind of build:

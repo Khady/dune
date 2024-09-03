@@ -53,6 +53,185 @@ let print_rule_makefile ppf (rule : Dune_engine.Reflection.Rule.t) =
     (Action_to_sh.pp action)
 ;;
 
+module Ninja = struct
+  module Simplified = struct
+    type destination =
+      | Dev_null
+      | File of string
+
+    type source = string
+
+    type t =
+      | Run of string * string list
+      | Chdir of string
+      | Setenv of string * string
+      | Redirect_out of t list * Action.Outputs.t * destination
+      | Redirect_in of t list * Action.Inputs.t * source
+      | Pipe of t list list * Action.Outputs.t
+      | Sh of string
+      | Concurrent of t list list
+  end
+
+  open Simplified
+
+  let echo s =
+    let lines = String.split_lines s in
+    if String.is_suffix s ~suffix:"\n"
+    then List.map lines ~f:(fun s -> Run ("echo", [ "'" ^ s ^ "'" ]))
+    else (
+      match List.rev lines with
+      | [] -> [ Run ("echo", [ "-n" ]) ]
+      | last :: rest ->
+        List.fold_left
+          rest
+          ~init:[ Run ("echo", [ "-n"; "'" ^ last ^ "'" ]) ]
+          ~f:(fun acc s -> Run ("echo", [ "'" ^ s ^ "'" ]) :: acc))
+  ;;
+
+  let cat ps = Run ("cat", ps)
+  let mkdir p = Run ("mkdir", [ "-p"; p ])
+
+  let interpret_perm (perm : Action.File_perm.t) fn acc =
+    match perm with
+    | Normal -> acc
+    | Executable -> Run ("chmod", [ "+x"; fn ]) :: acc
+  ;;
+
+  let simplify act =
+    let rec loop (act : Action.For_shell.t) acc =
+      match act with
+      | Run (prog, args) -> Run (prog, Array.Immutable.to_list args) :: acc
+      | With_accepted_exit_codes (_, t) -> loop t acc
+      | Dynamic_run (prog, args) -> Run (prog, args) :: acc
+      | Chdir (p, act) -> loop act (Chdir p :: mkdir p :: acc)
+      | Setenv (k, v, act) -> loop act (Setenv (k, v) :: acc)
+      | Redirect_out (outputs, fn, perm, act) ->
+        interpret_perm perm fn (Redirect_out (block act, outputs, File fn) :: acc)
+      | Redirect_in (inputs, fn, act) -> Redirect_in (block act, inputs, fn) :: acc
+      | Ignore (outputs, act) -> Redirect_out (block act, outputs, Dev_null) :: acc
+      | Progn l -> List.fold_left l ~init:acc ~f:(fun acc act -> loop act acc)
+      | Concurrent l -> Concurrent (List.map ~f:block l) :: acc
+      | Echo xs -> echo (String.concat xs ~sep:"")
+      | Cat x -> cat x :: acc
+      | Copy (x, y) -> Run ("cp", [ x; y ]) :: acc
+      | Symlink (x, y) -> Run ("ln", [ "-s"; x; y ]) :: Run ("rm", [ "-f"; y ]) :: acc
+      | Hardlink (x, y) -> Run ("ln", [ x; y ]) :: Run ("rm", [ "-f"; y ]) :: acc
+      | Bash x -> Run ("bash", [ "-e"; "-u"; "-o"; "pipefail"; "-c"; x ]) :: acc
+      | Write_file (x, perm, y) ->
+        interpret_perm perm x (Redirect_out (echo y, Stdout, File x) :: acc)
+      | Rename (x, y) -> Run ("mv", [ x; y ]) :: acc
+      | Remove_tree x -> Run ("rm", [ "-rf"; x ]) :: acc
+      | Mkdir x -> mkdir x :: acc
+      | Pipe (outputs, l) -> Pipe (List.map ~f:block l, outputs) :: acc
+      | Extension _ -> Sh "# extensions are not supported" :: acc
+    and block act =
+      match List.rev (loop act []) with
+      | [] -> [ Run ("true", []) ]
+      | l -> l
+    in
+    block act
+  ;;
+
+  let rec encode (act : t) =
+    match act with
+    | Run (prog, args) -> prog :: args
+    | Chdir dir -> [ "cd"; dir ]
+    | Setenv (k, v) -> [ "export"; k ^ "=" ^ v ]
+    | Sh s -> [ s ]
+    | Concurrent _ -> assert false
+    | Pipe (l, outputs) ->
+      let first_pipe, end_ =
+        match outputs with
+        | Stdout -> " | ", ""
+        | Outputs -> " 2>&1 | ", ""
+        | Stderr -> " 2> >( ", " 1>&2 )"
+      in
+      (match l with
+       | [] -> assert false
+       | first :: l ->
+         List.concat
+           [ encode_block first
+           ; [ first_pipe ]
+           ; List.concat (List.map l ~f:encode_block)
+           ; [ end_ ]
+           ])
+    | Redirect_out (l, outputs, dest) ->
+      let body = encode_block l in
+      List.concat
+        [ body
+        ; [ (match outputs with
+             | Stdout -> ">"
+             | Stderr -> "2>"
+             | Outputs -> "&>")
+          ]
+        ; [ (match dest with
+             | Dev_null -> "/dev/null"
+             | File fn -> fn)
+          ]
+        ]
+    | Redirect_in (l, inputs, src) ->
+      let body = encode_block l in
+      List.concat
+        [ body
+        ; [ (match inputs with
+             | Stdin -> "<")
+          ]
+        ; [ src ]
+        ]
+
+  and encode_block l =
+    let cmds = List.map ~f:encode l in
+    let cmds = List.intersperse cmds ~sep:[ "&&" ] in
+    List.concat [ [ "(" ]; List.concat cmds; [ ")" ] ]
+  ;;
+
+  let name_of_outputs outputs =
+    let s = String.concat ~sep:"" outputs in
+    Digest.string s |> Digest.to_string
+  ;;
+
+  let make_rule ~inputs ~outputs act =
+    let act = simplify act in
+    let name = name_of_outputs outputs in
+    let command = encode_block act in
+    let rule = Ninja_utils.rule ~description:[] ~command name in
+    let build = Ninja_utils.build name ~inputs ~outputs in
+    [ rule; build ]
+  ;;
+end
+
+let print_rule_ninja ppf (rule : Dune_engine.Reflection.Rule.t) =
+  let action =
+    Action.For_shell.Progn
+      [ Mkdir (Path.to_string (Path.build rule.targets.root))
+      ; Action.for_shell rule.action
+      ]
+  in
+  (* Makefiles seem to allow directory targets, so we include them. *)
+  let targets =
+    Filename.Set.union rule.targets.files rule.targets.dirs
+    |> Filename.Set.to_list_map ~f:(fun basename ->
+      Path.Build.relative rule.targets.root basename |> Path.build)
+  in
+  let inputs = Path.Set.to_list_map ~f:Path.to_string rule.expanded_deps in
+  let outputs = List.map ~f:Path.to_string targets in
+  let ninja = Ninja.make_rule ~inputs ~outputs action in
+  let ninja = List.to_seq ninja in
+  Ninja_utils.format ppf ninja
+;;
+
+(* Format.fprintf
+    ppf
+    "@[<hov 2>@{<makefile-stuff>%a:%t@}@]@,@<0>\t@{<makefile-action>%a@}\n"
+    (Format.pp_print_list ~pp_sep:Format.pp_print_space (fun ppf p ->
+       Format.pp_print_string ppf (Path.to_string p)))
+    targets
+    (fun ppf ->
+      Path.Set.iter rule.expanded_deps ~f:(fun dep ->
+        Format.fprintf ppf "@ %s" (Path.to_string dep)))
+    Pp.to_fmt
+    (Action_to_sh.pp action) *)
+
 let rec encode : Action.For_shell.t -> Dune_lang.t =
   let module Outputs = Dune_lang.Action.Outputs in
   let module File_perm = Dune_lang.Action.File_perm in
@@ -183,16 +362,23 @@ module Syntax = struct
   type t =
     | Makefile
     | Sexp
+    | Ninja
 
   let term =
-    let doc = "Output the rules in Makefile syntax." in
-    let+ makefile = Arg.(value & flag & info [ "m"; "makefile" ] ~doc) in
-    if makefile then Makefile else Sexp
+    let doc = "Output the rules in specified syntax." in
+    let+ syntax =
+      Arg.(
+        value
+        & opt (enum [ "sexp", Sexp; "makefile", Makefile; "ninja", Ninja ]) Sexp
+        & info [ "s"; "syntax" ] ~doc)
+    in
+    syntax
   ;;
 
   let print_rule = function
     | Makefile -> print_rule_makefile
     | Sexp -> print_rule_sexp
+    | Ninja -> print_rule_ninja
   ;;
 
   let print_rules syntax ppf rules =
